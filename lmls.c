@@ -35,7 +35,7 @@ int main(int argc,char **args)
 
 
 
-  // ************ TODO READ MATRICES AND VECTOR x FROM INPUT *****
+  // ************ READ MATRICES AND VECTOR x FROM INPUT *****
 
 
   // M11 and M12
@@ -315,6 +315,7 @@ int main(int argc,char **args)
   ierr = MatLUFactor(L11, perm, iperm, &info); CHKERRQ(ierr);
 
   ierr = MatMatSolve(L11, I, L11_inv);CHKERRQ(ierr);
+  // TODO try to convert L11_inv to be sparse such as matseqaij
 
 //  ierr = MatView(L11_inv, PETSC_VIEWER_STDOUT_SELF);CHKERRQ(ierr);
   ierr = MatGetOrdering(L22,MATORDERINGNATURAL,&perm,&iperm);CHKERRQ(ierr);
