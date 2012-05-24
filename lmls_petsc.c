@@ -253,7 +253,7 @@ int main(int argc,char **args)
   // ******************** TESTING *********************************
 
 
-    // TODO the testing doesn't work if the number of process are more than one
+    // the testing doesn't work if the number of process are more than one
     // because the type of the matrices must be different from matmpiaij. Let's try matseqaij
   Mat L11_inv, L22_inv, I;
   Mat A;
@@ -307,7 +307,7 @@ int main(int argc,char **args)
   ierr = MatAssemblyEnd(M11_d,MAT_FINAL_ASSEMBLY);CHKERRQ(ierr);
 
 
-  // Calculate A = L^{-1}*(M11 + M12*L22^{-1}*L21)
+  // Calculate A = L11^{-1}*(M11 + M12*L22^{-1}*L21)
   IS perm, iperm;
   MatFactorInfo info;
   ierr = MatGetOrdering(L11,MATORDERINGNATURAL,&perm,&iperm);CHKERRQ(ierr);
