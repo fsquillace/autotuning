@@ -1,24 +1,39 @@
 
 /* Program usage:  mpiexec -n <procs> ex2 [-help] [all PETSc options] */ 
 
-static char help[] = "Solves a sparse matrix-vector multiplication and a vector vector multiplication.\n\
+static char help[] = "Solves a linear system in parallel with KSP.\n\
 Input parameters include:\n\
+  -random_exact_sol : use a random exact solution vector\n\
+  -view_exact_sol   : write exact solution vector to stdout\n\
   -m <mesh_x>       : number of mesh points in x-direction\n\
   -n <mesh_n>       : number of mesh points in y-direction\n\n";
 
 /*T
-   Concepts: Sparse matrix-vector multiplication SpMV
+   Concepts: KSP^basic parallel example;
+   Concepts: KSP^Laplacian, 2d
+   Concepts: Laplacian, 2d
    Processors: n
 T*/
 
-#include <petscmat.h>
+/* 
+  Include "petscksp.h" so that we can use KSP solvers.  Note that this file
+  automatically includes:
+     petscsys.h       - base PETSc routines   petscvec.h - vectors
+     petscmat.h - matrices
+     petscis.h     - index sets            petscksp.h - Krylov subspace methods
+     petscviewer.h - viewers               petscpc.h  - preconditioners
+*/
+#include <petscksp.h>
 
 #undef __FUNCT__
 #define __FUNCT__ "main"
 int main(int argc,char **args)
 {
-  Vec            x,y;  /* approx solution, RHS, exact solution */
+  Vec            x,b,u;  /* approx solution, RHS, exact solution */
   Mat            A;        /* linear system matrix */
+  KSP            ksp;     /* linear solver context */
+  PetscRandom    rctx;     /* random number generator context */
+  PetscReal      norm;     /* norm of solution error */
   PetscInt       i,j,Ii,J,Istart,Iend,m = 8,n = 7,its;
   PetscErrorCode ierr;
   PetscBool      flg = PETSC_FALSE;
@@ -31,7 +46,8 @@ int main(int argc,char **args)
   ierr = PetscOptionsGetInt(PETSC_NULL,"-m",&m,PETSC_NULL);CHKERRQ(ierr);
   ierr = PetscOptionsGetInt(PETSC_NULL,"-n",&n,PETSC_NULL);CHKERRQ(ierr);
   /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
-         Compute the SpMV.
+         Compute the matrix and right-hand-side vector that define
+         the linear system, Ax = b.
      - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
   /* 
      Create parallel matrix, specifying only its global dimensions.
@@ -91,7 +107,7 @@ int main(int argc,char **args)
   ierr = PetscLogStagePop();CHKERRQ(ierr);
 
   /* A is symmetric. Set symmetric flag to enable ICC/Cholesky preconditioner */
-  /*ierr = MatSetOption(A,MAT_SYMMETRIC,PETSC_TRUE);CHKERRQ(ierr);*/
+  ierr = MatSetOption(A,MAT_SYMMETRIC,PETSC_TRUE);CHKERRQ(ierr);
 
   /* 
      Create parallel vectors.
@@ -109,26 +125,107 @@ int main(int argc,char **args)
         (replacing the PETSC_DECIDE argument in the VecSetSizes() statement
         below).
   */
-  ierr = VecCreate(PETSC_COMM_WORLD,&x);CHKERRQ(ierr);
-  ierr = VecSetSizes(x,PETSC_DECIDE,m*n);CHKERRQ(ierr);
-  ierr = VecSetFromOptions(x);CHKERRQ(ierr);
-  ierr = VecDuplicate(x,&y);CHKERRQ(ierr); 
+  ierr = VecCreate(PETSC_COMM_WORLD,&u);CHKERRQ(ierr);
+  ierr = VecSetSizes(u,PETSC_DECIDE,m*n);CHKERRQ(ierr);
+  ierr = VecSetFromOptions(u);CHKERRQ(ierr);
+  ierr = VecDuplicate(u,&b);CHKERRQ(ierr); 
+  ierr = VecDuplicate(b,&x);CHKERRQ(ierr);
 
   /* 
      Set exact solution; then compute right-hand-side vector.
-     By default we use the vector x with all elements of 1.0;
+     By default we use an exact solution of a vector with all
+     elements of 1.0;  Alternatively, using the runtime option
+     -random_sol forms a solution vector with random components.
   */
-  ierr = VecSet(x,1.0);CHKERRQ(ierr);
-  ierr = MatMult(A,x,y);CHKERRQ(ierr);
-  /*PetscScalar val=0.0;*/
-  /*ierr = VecDot(x,y,&val); CHKERRQ(ierr);*/
+  ierr = PetscOptionsGetBool(PETSC_NULL,"-random_exact_sol",&flg,PETSC_NULL);CHKERRQ(ierr);
+  if (flg) {
+    ierr = PetscRandomCreate(PETSC_COMM_WORLD,&rctx);CHKERRQ(ierr);
+    ierr = PetscRandomSetFromOptions(rctx);CHKERRQ(ierr);
+    ierr = VecSetRandom(u,rctx);CHKERRQ(ierr);
+    ierr = PetscRandomDestroy(&rctx);CHKERRQ(ierr);
+  } else {
+    ierr = VecSet(u,1.0);CHKERRQ(ierr);
+  }
+  ierr = MatMult(A,u,b);CHKERRQ(ierr);
+
+  /*
+     View the exact solution vector if desired
+  */
+  flg  = PETSC_FALSE;
+  ierr = PetscOptionsGetBool(PETSC_NULL,"-view_exact_sol",&flg,PETSC_NULL);CHKERRQ(ierr);
+  if (flg) {ierr = VecView(u,PETSC_VIEWER_STDOUT_WORLD);CHKERRQ(ierr);}
+
+  /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+                Create the linear solver and set various options
+     - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+  /* 
+     Create linear solver context
+  */
+  ierr = KSPCreate(PETSC_COMM_WORLD,&ksp);CHKERRQ(ierr);
+
+  /* 
+     Set operators. Here the matrix that defines the linear system
+     also serves as the preconditioning matrix.
+  */
+  ierr = KSPSetOperators(ksp,A,A,DIFFERENT_NONZERO_PATTERN);CHKERRQ(ierr);
+
+  /* 
+     Set linear solver defaults for this problem (optional).
+     - By extracting the KSP and PC contexts from the KSP context,
+       we can then directly call any KSP and PC routines to set
+       various options.
+     - The following two statements are optional; all of these
+       parameters could alternatively be specified at runtime via
+       KSPSetFromOptions().  All of these defaults can be
+       overridden at runtime, as indicated below.
+  */
+  ierr = KSPSetTolerances(ksp,1.e-2/((m+1)*(n+1)),1.e-50,PETSC_DEFAULT,
+                          PETSC_DEFAULT);CHKERRQ(ierr);
+
+  /* 
+    Set runtime options, e.g.,
+        -ksp_type <type> -pc_type <type> -ksp_monitor -ksp_rtol <rtol>
+    These options will override those specified above as long as
+    KSPSetFromOptions() is called _after_ any other customization
+    routines.
+  */
+  ierr = KSPSetFromOptions(ksp);CHKERRQ(ierr);
+
+  /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+                      Solve the linear system
+     - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+  ierr = KSPSolve(ksp,b,x);CHKERRQ(ierr);
+
+  /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+                      Check solution and clean up
+     - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+  /* 
+     Check the error
+  */
+  ierr = VecAXPY(x,-1.0,u);CHKERRQ(ierr);
+  ierr = VecNorm(x,NORM_2,&norm);CHKERRQ(ierr);
+  ierr = KSPGetIterationNumber(ksp,&its);CHKERRQ(ierr);
+  /* Scale the norm */
+  /*  norm *= sqrt(1.0/((m+1)*(n+1))); */
+
+  /*
+     Print convergence information.  PetscPrintf() produces a single 
+     print statement from all processes that share a communicator.
+     An alternative is PetscFPrintf(), which prints to a file.
+  */
+  ierr = PetscPrintf(PETSC_COMM_WORLD,"Norm of error %A iterations %D\n",
+                     norm,its);CHKERRQ(ierr);
 
   /*
      Free work space.  All PETSc objects should be destroyed when they
      are no longer needed.
   */
-  ierr = VecDestroy(&x);CHKERRQ(ierr);  ierr = VecDestroy(&y);CHKERRQ(ierr);
-  ierr = MatDestroy(&A);CHKERRQ(ierr);
+  ierr = KSPDestroy(&ksp);CHKERRQ(ierr);
+  ierr = VecDestroy(&u);CHKERRQ(ierr);  ierr = VecDestroy(&x);CHKERRQ(ierr);
+  ierr = VecDestroy(&b);CHKERRQ(ierr);  ierr = MatDestroy(&A);CHKERRQ(ierr);
 
   /*
      Always call PetscFinalize() before exiting a program.  This routine
